@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 
-# -------------------- Настройки чтения --------------------
+# -------------------- Настройки --------------------
 
 POSSIBLE_ENCODINGS = ["utf-8-sig", "utf-8", "cp1251", "latin-1"]
 
@@ -17,9 +17,9 @@ PREFIX_CATEGORY = "Категория:"
 PREFIX_AUTHOR = "Автор:"
 PREFIX_TITLE = "Название:"
 
-STATUS_NONE = 0       # без выделения
-STATUS_DONE = 1       # выполнено
-STATUS_PRIORITY = 2   # приоритет
+STATUS_NONE = 0
+STATUS_DONE = 1
+STATUS_PRIORITY = 2
 
 STATUS_LABEL = {
     STATUS_NONE: "",
@@ -27,12 +27,12 @@ STATUS_LABEL = {
     STATUS_PRIORITY: "⭐",
 }
 
-# Для сортировки статуса (по возрастанию). Можно поменять порядок как вам удобнее.
-STATUS_SORT_KEY = {
-    "": 0,
-    "✅": 1,
-    "⭐": 2,
-}
+# порядок сортировки статуса (можете поменять, если нужно)
+STATUS_SORT_KEY = {"": 0, "✅": 1, "⭐": 2}
+
+# разделители, которые почти никогда не встретятся в тексте
+CAT_SEP = "\u001f"   # unit separator (для хранения категорий в SQLite)
+IID_SEP = "\u001e"   # record separator (для iid строк Treeview)
 
 
 # -------------------- Утилиты --------------------
@@ -66,13 +66,52 @@ def db_file() -> Path:
     return data_dir() / "index.db"
 
 
+def _ensure_schema(conn: sqlite3.Connection):
+    """Мягкая миграция схемы под новые колонки."""
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS articles (path TEXT PRIMARY KEY)")
+    cur.execute("PRAGMA table_info(articles)")
+    cols = {r[1] for r in cur.fetchall()}
+
+    # старые версии могли иметь "category" вместо "categories"
+    if "categories" not in cols and "category" in cols:
+        try:
+            cur.execute("ALTER TABLE articles ADD COLUMN categories TEXT DEFAULT ''")
+            cur.execute("UPDATE articles SET categories = category WHERE categories = ''")
+        except Exception:
+            pass
+
+    if "categories" not in cols and "category" not in cols:
+        try:
+            cur.execute("ALTER TABLE articles ADD COLUMN categories TEXT DEFAULT ''")
+        except Exception:
+            pass
+
+    for col, ddl in [
+        ("author", "TEXT DEFAULT ''"),
+        ("title", "TEXT DEFAULT ''"),
+        ("mtime", "REAL DEFAULT 0"),
+        ("size", "INTEGER DEFAULT 0"),
+        ("status", "INTEGER DEFAULT 0"),
+    ]:
+        if col not in cols:
+            try:
+                cur.execute(f"ALTER TABLE articles ADD COLUMN {col} {ddl}")
+            except Exception:
+                pass
+
+    conn.commit()
+
+
 def db_connect() -> sqlite3.Connection:
     """Соединение SQLite. Не шарим между потоками."""
     conn = sqlite3.connect(db_file(), timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=30000")
+    _ensure_schema(conn)
 
+    # если таблицы не было, создадим нормальную (безопасно повторять)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS articles (
             path TEXT PRIMARY KEY,
@@ -91,31 +130,41 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
+def pack_categories(categories: list[str]) -> str:
+    return CAT_SEP.join(categories)
+
+
+def unpack_categories(s: str) -> list[str]:
+    if not s:
+        return []
+    return [x for x in s.split(CAT_SEP) if x]
+
+
 def read_header_fields(path: str):
     """
-    Возвращает (categories_list, author, title).
-    categories_list — список категорий (может быть пустым).
+    Возвращает (categories_list, author, title)
+    categories_list — список категорий из первой строки (через запятую)
     """
     lines = None
     for enc in POSSIBLE_ENCODINGS:
         try:
-            with open(path, "r", encoding=enc, errors="strict") as f:
-                lines = []
-                for _ in range(10):  # берем чуть больше строк на случай пустых
+            with open(path, "r", encoding=enc, errors="strict", newline="") as f:
+                raw = []
+                for _ in range(10):  # на случай пустых строк
                     s = f.readline()
                     if not s:
                         break
                     s = s.strip()
                     if s:
-                        lines.append(s)
-                    if len(lines) >= 3:
+                        raw.append(s)
+                    if len(raw) >= 3:
                         break
+            lines = raw
             break
         except Exception:
             lines = None
 
     if not lines:
-        # Фоллбек: читаем как получится
         with open(path, "r", encoding="cp1251", errors="replace") as f:
             lines = [f.readline().strip() for _ in range(3)]
 
@@ -131,30 +180,17 @@ def read_header_fields(path: str):
         elif ln.startswith(PREFIX_TITLE):
             title = ln[len(PREFIX_TITLE):].strip()
 
-    # Категорий может быть несколько через запятую
     categories = [c.strip() for c in category_raw.split(",") if c.strip()]
     return categories, author, title
 
 
-def pack_categories(categories: list[str]) -> str:
-    """Сохраняем категории в БД одной строкой."""
-    # Используем разделитель, которого не бывает в обычных названиях категорий
-    return "|".join(categories)
-
-
-def unpack_categories(s: str) -> list[str]:
-    if not s:
-        return []
-    return [x for x in s.split("|") if x]
-
-
-# -------------------- GUI приложение --------------------
+# -------------------- GUI --------------------
 
 class TxtIndexerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("TXT Indexer (multi-category + status)")
-        self.geometry("1250x680")
+        self.title("TXT Indexer (multi-category + status + search)")
+        self.geometry("1300x700")
 
         try:
             locale.setlocale(locale.LC_COLLATE, "")
@@ -162,6 +198,7 @@ class TxtIndexerApp(tk.Tk):
             pass
 
         self.folder = tk.StringVar(value="")
+        self.search_var = tk.StringVar(value="")
         self.status_text = tk.StringVar(value="Выберите папку с TXT файлами")
 
         self._q = queue.Queue()
@@ -170,8 +207,16 @@ class TxtIndexerApp(tk.Tk):
 
         self._sort_state = {"status": True, "category": True, "author": True, "title": True}
 
+        # кэш записей из БД: список dict по файлам
+        self._file_records = []  # каждый: {"path","categories","author","title","status"}
+        # индексы для обновления статуса
+        self._path_to_row_iids = {}  # path -> [iid,...]
+
+        self._search_after_id = None
+
         self._build_ui()
-        self.load_from_cache()
+        self.reload_cache_from_db()
+        self.render_table()
 
         self.after(150, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -183,23 +228,31 @@ class TxtIndexerApp(tk.Tk):
         top.pack(fill="x")
 
         ttk.Label(top, text="Папка:").pack(side="left")
-        ttk.Entry(top, textvariable=self.folder, width=75).pack(side="left", padx=8)
+        ttk.Entry(top, textvariable=self.folder, width=60).pack(side="left", padx=8)
         ttk.Button(top, text="Выбрать…", command=self.choose_folder).pack(side="left")
         ttk.Button(top, text="Переиндексировать", command=self.reindex).pack(side="left", padx=8)
 
-        # Таблица
+        ttk.Label(top, text="Поиск:").pack(side="left", padx=(20, 5))
+        search_entry = ttk.Entry(top, textvariable=self.search_var, width=35)
+        search_entry.pack(side="left")
+        ttk.Button(top, text="Очистить", command=self.clear_search).pack(side="left", padx=6)
+
+        # реагируем на ввод в поиске (debounce)
+        self.search_var.trace_add("write", lambda *_: self.on_search_changed())
+
         columns = ("status", "category", "author", "title")
         self.tree = ttk.Treeview(self, columns=columns, show="headings")
 
+        # сортировка только по клику на шапке (heading command)
         self.tree.heading("status", text="Статус", command=lambda: self.sort_by("status"))
         self.tree.heading("category", text="Категория", command=lambda: self.sort_by("category"))
         self.tree.heading("author", text="Автор", command=lambda: self.sort_by("author"))
         self.tree.heading("title", text="Название", command=lambda: self.sort_by("title"))
 
         self.tree.column("status", width=80, anchor="center")
-        self.tree.column("category", width=280, anchor="w")
-        self.tree.column("author", width=220, anchor="w")
-        self.tree.column("title", width=600, anchor="w")
+        self.tree.column("category", width=300, anchor="w")
+        self.tree.column("author", width=240, anchor="w")
+        self.tree.column("title", width=620, anchor="w")
 
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
@@ -209,16 +262,33 @@ class TxtIndexerApp(tk.Tk):
         vsb.place(in_=self.tree, relx=1.0, rely=0, relheight=1.0, anchor="ne")
         hsb.pack(fill="x", padx=10, pady=(0, 0))
 
-        # Открытие файла по двойному клику
+        # Двойной клик — открыть файл
         self.tree.bind("<Double-1>", self.on_double_click)
-        # Переключение статуса по клику в колонке Статус
-        self.tree.bind("<Button-1>", self.on_click)
+
+        # ОДИНАРНЫЙ клик по строке — смена статуса (а шапка — сортировка)
+        # Важно: отличаем region "heading" и "cell"
+        self.tree.bind("<Button-1>", self.on_single_click)
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
         ttk.Label(bottom, textvariable=self.status_text).pack(side="left")
 
-    # ---------- Выбор папки ----------
+    # ---------- Поиск ----------
+
+    def on_search_changed(self):
+        # debounce: чтобы не перерисовывать на каждый символ мгновенно
+        if self._search_after_id is not None:
+            try:
+                self.after_cancel(self._search_after_id)
+            except Exception:
+                pass
+        self._search_after_id = self.after(200, self.render_table)
+
+    def clear_search(self):
+        self.search_var.set("")
+        self.render_table()
+
+    # ---------- Папка ----------
 
     def choose_folder(self):
         folder = filedialog.askdirectory(title="Выберите папку с TXT файлами")
@@ -226,35 +296,83 @@ class TxtIndexerApp(tk.Tk):
             self.folder.set(folder)
             self.reindex()
 
-    # ---------- Загрузка из кэша (БД) ----------
+    # ---------- DB cache ----------
 
-    def load_from_cache(self):
-        self.tree.delete(*self.tree.get_children())
-
+    def reload_cache_from_db(self):
         conn = db_connect()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT path, categories, author, title, status FROM articles")
+            # COALESCE на случай старого поля category
+            cur.execute("""
+                SELECT
+                    path,
+                    COALESCE(categories, category, '') AS categories,
+                    author,
+                    title,
+                    status
+                FROM articles
+            """)
             rows = cur.fetchall()
         finally:
             conn.close()
 
-        inserted = 0
+        self._file_records = []
         for path, cats_s, author, title, status in rows:
             cats = unpack_categories(cats_s)
-            if not cats:
-                cats = [""]  # если категорий нет — показываем одной строкой
+            self._file_records.append({
+                "path": path,
+                "categories": cats,
+                "author": author or "",
+                "title": title or "",
+                "status": int(status) if status is not None else 0
+            })
 
-            for cat in cats:
-                # iid должен быть уникален -> path + категория
-                iid = f"{path}||{cat}"
+    # ---------- Table render ----------
+
+    def render_table(self):
+        """Перерисовать таблицу из self._file_records с учётом поиска."""
+        q = (self.search_var.get() or "").strip().lower()
+
+        # очищаем
+        self.tree.delete(*self.tree.get_children())
+        self._path_to_row_iids = {}
+
+        shown_files = 0
+        shown_rows = 0
+
+        for rec in self._file_records:
+            path = rec["path"]
+            categories = rec["categories"][:] if rec["categories"] else [""]  # одна строка если нет категорий
+            author = rec["author"]
+            title = rec["title"]
+            status_symbol = STATUS_LABEL.get(rec["status"], "")
+
+            base_name = os.path.basename(path)
+
+            # фильтр по любому полю (самый стабильный подход)
+            if q:
+                hay = " ".join([
+                    " ".join(categories),
+                    author,
+                    title,
+                    base_name,
+                    path
+                ]).lower()
+                if q not in hay:
+                    continue
+
+            shown_files += 1
+
+            for cat in categories:
+                iid = f"{path}{IID_SEP}{cat}"
                 self.tree.insert(
                     "", "end", iid=iid,
-                    values=(STATUS_LABEL.get(status, ""), cat, author, title)
+                    values=(status_symbol, cat, author, title)
                 )
-                inserted += 1
+                self._path_to_row_iids.setdefault(path, []).append(iid)
+                shown_rows += 1
 
-        self.status_text.set(f"Загружено из кэша: файлов {len(rows)}, строк в таблице {inserted}.")
+        self.status_text.set(f"Показано файлов: {shown_files}, строк: {shown_rows}. Поиск: '{self.search_var.get().strip()}'")
 
     # ---------- Индексация ----------
 
@@ -267,9 +385,7 @@ class TxtIndexerApp(tk.Tk):
         if self._worker and self._worker.is_alive():
             return
 
-        self.load_from_cache()
         self.status_text.set("Синхронизация с папкой…")
-
         self._stop_flag = False
         self._worker = threading.Thread(target=self._worker_func, args=(folder,), daemon=True)
         self._worker.start()
@@ -304,7 +420,7 @@ class TxtIndexerApp(tk.Tk):
                     st = os.stat(path)
                     mtime, size = st.st_mtime, st.st_size
 
-                    cur.execute("SELECT mtime, size FROM articles WHERE path=?", (path,))
+                    cur.execute("SELECT mtime, size, status FROM articles WHERE path=?", (path,))
                     row = cur.fetchone()
                     if row and row[0] == mtime and row[1] == size:
                         total += 1
@@ -313,10 +429,7 @@ class TxtIndexerApp(tk.Tk):
                     categories, author, title = read_header_fields(path)
                     cats_s = pack_categories(categories)
 
-                    # статус сохраняем старый, если запись уже была
-                    cur.execute("SELECT status FROM articles WHERE path=?", (path,))
-                    old = cur.fetchone()
-                    old_status = old[0] if old else STATUS_NONE
+                    old_status = row[2] if row else STATUS_NONE
 
                     cur.execute("""
                         INSERT INTO articles(path, categories, author, title, mtime, size, status)
@@ -328,7 +441,7 @@ class TxtIndexerApp(tk.Tk):
                             mtime=excluded.mtime,
                             size=excluded.size,
                             status=excluded.status
-                    """, (path, cats_s, author, title, mtime, size, old_status))
+                    """, (path, cats_s, author, title, mtime, size, int(old_status)))
 
                     updated += 1
                     total += 1
@@ -336,7 +449,7 @@ class TxtIndexerApp(tk.Tk):
                 except Exception:
                     errors += 1
 
-            # Удаляем записи, которых нет на диске
+            # удалить исчезнувшие файлы
             cur.execute("SELECT path FROM articles")
             all_paths = [r[0] for r in cur.fetchall()]
             for p in all_paths:
@@ -350,15 +463,14 @@ class TxtIndexerApp(tk.Tk):
 
         self._q.put(("done", (total, updated, deleted, errors)))
 
-    # ---------- Queue polling ----------
-
     def _poll_queue(self):
         try:
             while True:
                 kind, payload = self._q.get_nowait()
                 if kind == "done":
                     total, updated, deleted, errors = payload
-                    self.load_from_cache()
+                    self.reload_cache_from_db()
+                    self.render_table()
                     msg = f"Синхронизация: файлов {total}, обновлено {updated}, удалено {deleted}"
                     if errors:
                         msg += f", ошибок {errors}"
@@ -370,38 +482,39 @@ class TxtIndexerApp(tk.Tk):
 
         self.after(150, self._poll_queue)
 
-    # ---------- События UI ----------
+    # ---------- Кликовые действия ----------
 
     def on_double_click(self, event):
-        iid = self.tree.focus()
-        if not iid:
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
             return
-        path = iid.split("||", 1)[0]
+        path = row_id.split(IID_SEP, 1)[0]
         if os.path.exists(path):
             open_in_default_app(path)
         else:
             messagebox.showwarning("Файл не найден", "Файл был удалён или перемещён. Переиндексируйте папку.")
 
-    def on_click(self, event):
-        # Если кликнули по ячейке в колонке "Статус" — переключаем
+    def on_single_click(self, event):
         region = self.tree.identify_region(event.x, event.y)
-        if region != "cell":
+
+        # Клик по шапке -> не трогаем, сортировка уже на heading command
+        if region == "heading":
             return
 
-        col = self.tree.identify_column(event.x)
-        # #1 = первая колонка из show="headings", т.е. status
-        if col != "#1":
-            return
+        # Клик по строке (ячейке) -> переключаем статус
+        if region == "cell":
+            row_id = self.tree.identify_row(event.y)
+            if not row_id:
+                return
 
-        row_id = self.tree.identify_row(event.y)
-        if not row_id:
-            return
+            path = row_id.split(IID_SEP, 1)[0]
+            self.toggle_status(path)
 
-        path = row_id.split("||", 1)[0]
-        self.toggle_status(path)
+            # Обновляем символ статуса во всех строках этого файла без полной перерисовки
+            self.update_status_in_view(path)
 
-        # Обновляем таблицу (статус один на файл — обновится во всех категориях)
-        self.load_from_cache()
+            # Останавливаем дальнейшую обработку клика Treeview (чтобы не было побочных эффектов)
+            return "break"
 
     # ---------- Статус ----------
 
@@ -413,12 +526,33 @@ class TxtIndexerApp(tk.Tk):
             row = cur.fetchone()
             if not row:
                 return
-            status = row[0]
+            status = int(row[0]) if row[0] is not None else 0
             status = (status + 1) % 3
             cur.execute("UPDATE articles SET status=? WHERE path=?", (status, path))
             conn.commit()
         finally:
             conn.close()
+
+        # обновим в кэше self._file_records
+        for rec in self._file_records:
+            if rec["path"] == path:
+                rec["status"] = status
+                break
+
+    def update_status_in_view(self, path: str):
+        # Найдём новый символ
+        new_symbol = ""
+        for rec in self._file_records:
+            if rec["path"] == path:
+                new_symbol = STATUS_LABEL.get(rec["status"], "")
+                break
+
+        # Обновим все строки этого файла в Treeview
+        for iid in self._path_to_row_iids.get(path, []):
+            if self.tree.exists(iid):
+                vals = list(self.tree.item(iid, "values"))
+                vals[0] = new_symbol
+                self.tree.item(iid, values=vals)
 
     # ---------- Сортировка ----------
 
@@ -426,8 +560,7 @@ class TxtIndexerApp(tk.Tk):
         ascending = self._sort_state.get(col, True)
 
         def key_func(iid: str):
-            vals = self.tree.item(iid, "values")
-            # vals = (status_symbol, category, author, title)
+            vals = self.tree.item(iid, "values")  # (status, category, author, title)
             if col == "status":
                 return STATUS_SORT_KEY.get(vals[0], 0)
             if col == "category":
