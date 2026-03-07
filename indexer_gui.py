@@ -1,8 +1,6 @@
 import os
 import sys
 import sqlite3
-import threading
-import queue
 import locale
 from pathlib import Path
 import tkinter as tk
@@ -164,6 +162,8 @@ class TxtIndexerApp(tk.Tk):
 
         self.records = []
         self.path_iids = {}
+        self.sort_col = None
+        self.sort_reverse = False
 
         self._build_ui()
         self.load_from_db()
@@ -187,8 +187,14 @@ class TxtIndexerApp(tk.Tk):
         columns = ("status", "category", "author", "title")
         self.tree = ttk.Treeview(self, columns=columns, show="headings")
 
+        headers = {
+            "status": "Статус",
+            "category": "Категория",
+            "author": "Автор",
+            "title": "Название",
+        }
         for c in columns:
-            self.tree.heading(c, text=c.capitalize(), command=lambda col=c: self.sort(col))
+            self.tree.heading(c, text=headers[c], command=lambda col=c: self.sort(col))
 
         self.tree.column("status", width=80, anchor="center")
         self.tree.column("category", width=300)
@@ -197,7 +203,6 @@ class TxtIndexerApp(tk.Tk):
 
         self.tree.pack(fill="both", expand=True, padx=10)
         self.tree.bind("<Button-1>", self.on_click)
-        self.tree.bind("<Double-1>", self.on_open)
 
         ttk.Label(self, textvariable=self.status_text).pack(anchor="w", padx=10)
 
@@ -227,23 +232,49 @@ class TxtIndexerApp(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.path_iids = {}
 
+        rows = []
         for r in self.records:
-            if q:
-                hay = " ".join([
-                    r["title"],
-                    r["author"],
-                    " ".join(r["categories"]),
-                    os.path.basename(r["path"])
-                ]).lower()
-                if q not in hay:
-                    continue
+            hay = " ".join([
+                r["title"],
+                r["author"],
+                " ".join(r["categories"]),
+                os.path.basename(r["path"]),
+            ]).lower()
+            if q and q not in hay:
+                continue
 
             cats = r["categories"] or [""]
             for cat in cats:
-                iid = r["path"] + IID_SEP + cat
-                self.tree.insert("", "end", iid=iid,
-                    values=(STATUS_LABEL[r["status"]], cat, r["author"], r["title"]))
-                self.path_iids.setdefault(r["path"], []).append(iid)
+                rows.append({
+                    "path": r["path"],
+                    "category": cat,
+                    "author": r["author"],
+                    "title": r["title"],
+                    "status": r["status"],
+                })
+
+        if self.sort_col:
+            col = self.sort_col
+            if col == "status":
+                keyfunc = lambda row: STATUS_SORT_KEY[STATUS_LABEL[row["status"]]]
+            else:
+                keyfunc = lambda row: locale.strxfrm(str(row[col]).lower())
+            rows.sort(key=keyfunc, reverse=self.sort_reverse)
+
+        for row in rows:
+            iid = row["path"] + IID_SEP + row["category"]
+            self.tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    STATUS_LABEL[row["status"]],
+                    row["category"],
+                    row["author"],
+                    row["title"],
+                ),
+            )
+            self.path_iids.setdefault(row["path"], []).append(iid)
 
     # ---------- Actions ----------
 
@@ -286,14 +317,26 @@ class TxtIndexerApp(tk.Tk):
         self.render()
 
     def on_click(self, e):
-        if self.tree.identify_region(e.x, e.y) == "heading":
+        region = self.tree.identify_region(e.x, e.y)
+        if region != "cell":
             return
+
+        column = self.tree.identify_column(e.x)
         iid = self.tree.identify_row(e.y)
         if not iid:
-            return "break"
+            return
+
         path = iid.split(IID_SEP)[0]
-        self.toggle_status(path)
-        return "break"
+
+        # клик по колонке статуса — переключение статуса
+        if column == "#1":
+            self.toggle_status(path)
+            return "break"
+
+        # клик по названию — открыть файл в программе по умолчанию
+        if column == "#4":
+            open_in_default_app(path)
+            return "break"
 
     def toggle_status(self, path):
         conn = db_connect()
@@ -308,16 +351,12 @@ class TxtIndexerApp(tk.Tk):
         self.load_from_db()
         self.render()
 
-    def on_open(self, e):
-        iid = self.tree.identify_row(e.y)
-        if iid:
-            open_in_default_app(iid.split(IID_SEP)[0])
-
     def sort(self, col):
-        self.records.sort(key=lambda r: (
-            STATUS_SORT_KEY[STATUS_LABEL[r["status"]]] if col == "status" else
-            (r[col] if isinstance(r[col], str) else "")
-        ))
+        if self.sort_col == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_col = col
+            self.sort_reverse = False
         self.render()
 
 
